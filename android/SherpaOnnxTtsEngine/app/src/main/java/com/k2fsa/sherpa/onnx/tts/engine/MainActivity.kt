@@ -163,6 +163,7 @@ class MainActivity : ComponentActivity() {
                                         enabled = startEnabled,
                                         modifier = Modifier.padding(5.dp),
                                         onClick = {
+                                            onClick = {
                                             Log.i(TAG, "Clicked, text: $testText")
                                             if (testText.isBlank() || testText.isEmpty()) {
                                                 Toast.makeText(
@@ -178,94 +179,85 @@ class MainActivity : ComponentActivity() {
                                                 track.pause()
                                                 track.flush()
                                                 track.play()
-                                                rtfText = ""
+                                                rtfText = "Đang xử lý truyện dài..."
                                                 Log.i(TAG, "Started with text $testText")
 
+                                                // Luồng 1: Liên tục nhận âm thanh và phát ra loa
                                                 scope.launch {
                                                     for (samples in samplesChannel) {
-                                                        if (samples.isEmpty()) {
-                                                            break
-                                                        }
-
-                                                        Log.i(
-                                                            TAG,
-                                                            "Received ${samples.count()} samples"
-                                                        )
+                                                        if (samples.isEmpty()) break
                                                         track.write(
                                                             samples,
                                                             0,
                                                             samples.size,
                                                             AudioTrack.WRITE_BLOCKING
                                                         )
-                                                        if (stopped) {
-                                                            break
-                                                        }
+                                                        if (stopped) break
                                                     }
-                                                    Log.i(TAG, "Draining the channel")
-
-                                                    // drain remaining
+                                                    // Xả các sample còn sót lại
                                                     while (!samplesChannel.isEmpty) {
                                                         samplesChannel.tryReceive().getOrNull()
                                                     }
-                                                    Log.i(TAG, "Channel drained")
-
                                                 }
 
+                                                // Luồng 2: Xử lý chia nhỏ văn bản và tạo âm thanh
                                                 CoroutineScope(Dispatchers.Default).launch {
                                                     val timeSource = TimeSource.Monotonic
                                                     val startTime = timeSource.markNow()
 
-                                                    val audio =
-                                                        TtsEngine.tts!!.generateWithConfigAndCallback(
-                                                            text = testText,
+                                                    // --- BẮT ĐẦU THUẬT TOÁN CHUNKING ---
+                                                    // 1. Cắt văn bản theo dấu câu hoặc xuống dòng
+                                                    val chunks = testText.split(Regex("(?<=[.?!\\n])")).filter { it.isNotBlank() }
+                                                    var totalSamplesCount = 0
+
+                                                    // 2. Chạy vòng lặp đọc từng câu một
+                                                    for (chunk in chunks) {
+                                                        if (stopped) break // Dừng nếu người dùng bấm Stop
+                                                        val trimmedChunk = chunk.trim()
+                                                        if (trimmedChunk.isEmpty()) continue
+
+                                                        // 3. Ép dọn RAM của câu vừa đọc xong
+                                                        System.gc()
+                                                        System.runFinalization()
+
+                                                        // 4. Nhét câu hiện tại vào máy đọc
+                                                        val audio = TtsEngine.tts!!.generateWithConfigAndCallback(
+                                                            text = trimmedChunk,
                                                             config = GenerationConfig(sid = TtsEngine.speakerId, speed = TtsEngine.speed),
                                                             callback = ::callback,
                                                         )
+                                                        totalSamplesCount += audio.samples.size
+                                                    }
+                                                    // --- KẾT THÚC THUẬT TOÁN CHUNKING ---
 
-                                                    val elapsed =
-                                                        startTime.elapsedNow().inWholeMilliseconds.toFloat() / 1000;
-                                                    val audioDuration =
-                                                        audio.samples.size / TtsEngine.tts!!.sampleRate()
-                                                            .toFloat()
-                                                    val RTF = String.format(
-                                                        "Number of threads: %d\nElapsed: %.3f s\nAudio duration: %.3f s\nRTF: %.3f/%.3f = %.3f",
-                                                        TtsEngine.tts!!.config.model.numThreads,
-                                                        elapsed,
-                                                        audioDuration,
-                                                        elapsed,
-                                                        audioDuration,
-                                                        elapsed / audioDuration
-                                                    )
+                                                    // Tính toán thời gian phản hồi (RTF)
+                                                    val elapsed = startTime.elapsedNow().inWholeMilliseconds.toFloat() / 1000
+                                                    val audioDuration = totalSamplesCount / TtsEngine.tts!!.sampleRate().toFloat()
+                                                    val RTF = if (audioDuration > 0) {
+                                                        String.format(
+                                                            "Số luồng: %d\nThời gian tạo: %.3f s\nĐộ dài Audio: %.3f s\nRTF: %.3f/%.3f = %.3f",
+                                                            TtsEngine.tts!!.config.model.numThreads, elapsed, audioDuration, elapsed, audioDuration, elapsed / audioDuration
+                                                        )
+                                                    } else { "Hoàn thành" }
 
+                                                    // Báo hiệu kết thúc cho kênh phát âm thanh
                                                     scope.launch {
-                                                        Log.i(TAG, "send 0 samples")
-                                                            samplesChannel.send(FloatArray(0))
-                                                        Log.i(TAG, "send 0 samples done")
+                                                        samplesChannel.send(FloatArray(0))
                                                     }
 
-                                                    val filename =
-                                                        application.filesDir.absolutePath + "/generated.wav"
+                                                    // LƯU Ý: Vô hiệu hóa tính năng lưu file "generated.wav" 
+                                                    // Để tránh việc gom toàn bộ âm thanh của 1 chương truyện dài ghép thành 1 file khổng lồ làm tràn RAM.
+                                                    // (Chúng ta chỉ nghe online, không lưu file)
 
-
-                                                    val ok =
-                                                        audio.samples.isNotEmpty() && audio.save(
-                                                            filename
-                                                        )
-
-                                                    if (ok) {
-                                                        withContext(Dispatchers.Main) {
-                                                            startEnabled = true
-                                                            playEnabled = true
-                                                            rtfText = RTF
-                                                        }
-
-
+                                                    // Mở lại nút bấm khi đọc xong
+                                                    withContext(Dispatchers.Main) {
+                                                        startEnabled = true
+                                                        playEnabled = true
+                                                        rtfText = RTF
                                                     }
                                                 }
                                             }
-                                        }) {
-                                        Text("Start")
-                                    }
+                                        }
 
                                     Button(
                                         modifier = Modifier.padding(5.dp),
